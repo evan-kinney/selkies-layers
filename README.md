@@ -2,7 +2,7 @@
 
 Prebuilt, patched components for Selkies base images, forked from [linuxserver/selkies-layers](https://github.com/linuxserver/selkies-layers) with an added `multiuser` layer for multi-user Active Directory sign-on.
 
-Images live at `ghcr.io/evan-kinney/selkies-layers`. This fork is not supported by LinuxServer.io.
+Images live at `evandashkinney/selkies-layers`. This fork is not supported by LinuxServer.io.
 
 ## Layers
 
@@ -19,12 +19,12 @@ a single copy:
 
 ```dockerfile
 # Dockerfile (amd64)
-COPY --from=ghcr.io/evan-kinney/selkies-layers:debiantrixie-labwc / /
-COPY --from=ghcr.io/evan-kinney/selkies-layers:debiantrixie-wtype / /
+COPY --from=evandashkinney/selkies-layers:debiantrixie-labwc / /
+COPY --from=evandashkinney/selkies-layers:debiantrixie-wtype / /
 
 # Dockerfile.aarch64
-COPY --from=ghcr.io/evan-kinney/selkies-layers:arm64v8-debiantrixie-labwc / /
-COPY --from=ghcr.io/evan-kinney/selkies-layers:arm64v8-debiantrixie-wtype / /
+COPY --from=evandashkinney/selkies-layers:arm64v8-debiantrixie-labwc / /
+COPY --from=evandashkinney/selkies-layers:arm64v8-debiantrixie-wtype / /
 ```
 
 ## Tags
@@ -32,9 +32,9 @@ COPY --from=ghcr.io/evan-kinney/selkies-layers:arm64v8-debiantrixie-wtype / /
 Per layer three tags are pushed:
 
 ```
-ghcr.io/evan-kinney/selkies-layers:amd64-alpine324-labwc
-ghcr.io/evan-kinney/selkies-layers:arm64v8-alpine324-labwc
-ghcr.io/evan-kinney/selkies-layers:alpine324-labwc        # multi-arch manifest
+evandashkinney/selkies-layers:amd64-alpine324-labwc
+evandashkinney/selkies-layers:arm64v8-alpine324-labwc
+evandashkinney/selkies-layers:alpine324-labwc        # multi-arch manifest
 ```
 
 Current bases:
@@ -87,11 +87,15 @@ Only the Debian base has been tested end to end.
 
 ```dockerfile
 # Dockerfile (amd64)
-COPY --from=ghcr.io/evan-kinney/selkies-layers:amd64-debiantrixie-multiuser / /
+COPY --from=evandashkinney/selkies-layers:amd64-debiantrixie-multiuser / /
 
 # Dockerfile.aarch64
-COPY --from=ghcr.io/evan-kinney/selkies-layers:arm64v8-debiantrixie-multiuser / /
+COPY --from=evandashkinney/selkies-layers:arm64v8-debiantrixie-multiuser / /
 ```
 
-GHCR packages start out private. After the first push, make `selkies-layers` public in the package
-settings so other repositories and anonymous `docker build`s can pull it.
+## Publishing
+
+The workflow pushes to Docker Hub with two repository secrets: `DOCKERHUB_USERNAME`, and
+`DOCKERHUB_TOKEN` (a Docker Hub access token with read and write access to `evandashkinney`).
+The first push creates `evandashkinney/selkies-layers`. It must stay public so base image builds
+can pull the layers without logging in.
