@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+if [[ "${MULTI_USER,,}" != "true" ]]; then
+    exec sleep infinity
+fi
+
+# stale pid from an unclean stop blocks startup
+rm -f /var/run/sssd.pid /run/sssd.pid
+
+exec sssd -i --logger=stderr

@@ -34,7 +34,7 @@ on:
         default: true
 
 env:
-  LAYERS_IMAGE: ghcr.io/linuxserver/selkies-layers
+  LAYERS_IMAGE: ghcr.io/evan-kinney/selkies-layers
   RUNNER_AMD64: ubuntu-24.04
   RUNNER_ARM64: ubuntu-24.04-arm
 
@@ -150,7 +150,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=selkies-layers ${{ matrix.layer }} (${{ matrix.distro }} ${{ matrix.version }})
-            org.opencontainers.image.description=Prebuilt ${{ matrix.layer }} layer for linuxserver ${{ matrix.distro }} ${{ matrix.version }} selkies images
+            org.opencontainers.image.description=Prebuilt ${{ matrix.layer }} layer for ${{ matrix.distro }} ${{ matrix.version }} selkies images
             io.linuxserver.selkies-layers.distro=${{ matrix.distro }}
             io.linuxserver.selkies-layers.version=${{ matrix.version }}
             io.linuxserver.selkies-layers.layer=${{ matrix.layer }}

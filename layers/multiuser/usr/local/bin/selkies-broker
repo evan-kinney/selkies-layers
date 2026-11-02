@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Per user Selkies sessions behind nginx auth_request.
+
+nginx authenticates the user with PAM, then asks GET /session with the
+authenticated name in X-Remote-User. The first request for a user drops an
+s6 service in the scandir that runs selkies-user-session for them, every
+request answers with the Unix socket that user's Selkies listens on.
+"""
+
+import grp
+import os
+import re
+import shutil
+import socket
+import socketserver
+import stat
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler
+
+BROKER_SOCKET = "/run/selkies-broker.sock"
+SCANDIR = "/run/service"
+SESSION_DIR = "/run/selkies"
+SERVICE_PREFIX = "selkies-mu-"
+SVSCANCTL = "/command/s6-svscanctl"
+MAX_SESSIONS = int(os.environ.get("MULTI_USER_MAX_SESSIONS") or 8)
+START_TIMEOUT = 60
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# the group nginx workers run as, worked out by init-multiuser
+NGINX_GROUP = os.environ.get("MULTI_USER_NGINX_GROUP") or "www-data"
+
+lock = threading.Lock()
+
+
+def log(message):
+    print(f"[selkies-broker] {message}", file=sys.stderr, flush=True)
+
+
+def directory_user(name):
+    """The canonical name and uid of a directory (sssd) user, never a local account."""
+    if not name or len(name) > 256 or any(c in name for c in ":/\0\n"):
+        return None, None
+    found = subprocess.run(["getent", "-s", "sss", "passwd", name], capture_output=True, text=True)
+    fields = found.stdout.split(":")
+    if found.returncode != 0 or len(fields) < 3 or not NAME_RE.match(fields[0]):
+        return None, None
+    return fields[0], int(fields[2])
+
+
+def owned_socket(path, uid):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == uid
+
+
+def sealed(session_socket):
+    return os.lstat(os.path.dirname(session_socket)).st_uid == 0
+
+
+def seal(session_socket, uid):
+    """Take the socket folder from the user before nginx may connect.
+
+    While the user owns the folder they could swap the socket for a symlink
+    to someone else's, so it is checked, made root owned, and checked again
+    once nothing but root can change it. Only then does nginx get write
+    access to the socket, which connecting needs.
+    """
+    folder = os.path.dirname(session_socket)
+    if not owned_socket(session_socket, uid):
+        return False
+    os.chown(folder, 0, -1)
+    os.chmod(folder, 0o2750)
+    if not owned_socket(session_socket, uid):
+        return False
+    os.chmod(session_socket, 0o660)
+    return True
+
+
+def answers(path):
+    with socket.socket(socket.AF_UNIX) as probe:
+        try:
+            probe.connect(path)
+            return True
+        except OSError:
+            return False
+
+
+def ensure_service(name):
+    """Supervise a session for `name`, False when the session cap is reached."""
+    with lock:
+        service = os.path.join(SCANDIR, SERVICE_PREFIX + name)
+        if os.path.isdir(service):
+            return True
+        running = [d for d in os.listdir(SCANDIR) if d.startswith(SERVICE_PREFIX)]
+        if len(running) >= MAX_SESSIONS:
+            return False
+        # s6-svscan skips dot entries, so the service appears complete or not at all
+        staging = os.path.join(SCANDIR, "." + SERVICE_PREFIX + name)
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging)
+        run = os.path.join(staging, "run")
+        with open(run, "w") as fh:
+            fh.write(f"#!/bin/sh\nexec /usr/local/bin/selkies-user-session {name}\n")
+        os.chmod(run, 0o755)
+        os.rename(staging, service)
+        subprocess.run([SVSCANCTL, "-a", SCANDIR], check=False)
+        log(f"started session for {name} ({len(running) + 1}/{MAX_SESSIONS})")
+        return True
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/session":
+            return self.reply(404)
+        name, uid = directory_user(self.headers.get("X-Remote-User", "").strip())
+        if not name:
+            return self.reply(403)
+        session_socket = os.path.join(SESSION_DIR, name, "selkies.sock")
+        if not answers(session_socket):
+            if not ensure_service(name):
+                log(f"refusing {name}, MULTI_USER_MAX_SESSIONS ({MAX_SESSIONS}) reached")
+                return self.reply(503)
+            deadline = time.monotonic() + START_TIMEOUT
+            while not answers(session_socket):
+                if time.monotonic() > deadline:
+                    log(f"session for {name} did not come up within {START_TIMEOUT}s")
+                    return self.reply(504)
+                time.sleep(0.5)
+        with lock:
+            if not sealed(session_socket) and not seal(session_socket, uid):
+                log(f"socket for {name} is not a socket owned by {name}, refusing")
+                return self.reply(403)
+        self.reply(200, session_socket)
+
+    def reply(self, status, session_socket=None):
+        self.send_response(status)
+        if session_socket:
+            self.send_header("X-Selkies-Socket", session_socket)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def address_string(self):
+        return "nginx"
+
+    def log_message(self, format, *args):
+        pass
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def main():
+    if os.path.exists(BROKER_SOCKET):
+        os.unlink(BROKER_SOCKET)
+    os.umask(0o177)
+    server = Server(BROKER_SOCKET, Handler)
+    # only nginx may ask, desktop users must not reach it
+    os.chown(BROKER_SOCKET, 0, grp.getgrnam(NGINX_GROUP).gr_gid)
+    os.chmod(BROKER_SOCKET, 0o660)
+    log(f"listening on {BROKER_SOCKET}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

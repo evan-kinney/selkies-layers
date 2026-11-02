@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+
+# multi-user Active Directory sign-on: broker, per user session launcher, s6 services,
+# nginx and PAM config. Distro neutral, one file per distro keeps the <distro>-<layer> tags.
+# The base image still installs sssd, libnss-sss, libpam-sss and the nginx PAM module.
+FROM alpine:3.24 AS multiuser-stage
+
+COPY layers/multiuser/ /buildout/
+
+RUN \
+  echo "**** normalize line endings and permissions ****" && \
+  find /buildout -type f -exec sed -i 's/\r$//' {} + && \
+  find /buildout -type d -exec chmod 755 {} + && \
+  find /buildout -type f -exec chmod 644 {} + && \
+  chmod 755 \
+    /buildout/usr/local/bin/* \
+    /buildout/etc/s6-overlay/s6-rc.d/*/run
+
+FROM scratch
+COPY --from=multiuser-stage /buildout/ /

@@ -1,0 +1,134 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# single user mode, nothing to do
+if [[ "${MULTI_USER,,}" != "true" ]]; then
+    exit 0
+fi
+
+echo "[ls.io-init] Configuring multi-user mode"
+
+# unsupported combinations
+if [[ "${PIXELFLUX_WAYLAND,,}" == "true" ]] || [[ "${PELORUS,,}" == "true" ]] || [[ -n ${DEV_MODE+x} ]]; then
+    echo "[ls.io-init] MULTI_USER cannot be combined with PIXELFLUX_WAYLAND, PELORUS or DEV_MODE"
+    exit 1
+fi
+
+# required settings
+for var in LDAP_URI LDAP_BASE_DN LDAP_BIND_DN LDAP_BIND_PASSWORD; do
+    if [[ -z "${!var}" ]]; then
+        echo "[ls.io-init] MULTI_USER requires ${var} to be set"
+        exit 1
+    fi
+done
+
+# the group nginx workers run as, only it may reach the broker and session sockets
+# nginx.conf "user <user> [<group>];", a missing group means the group named like the user
+if [[ -z "${MULTI_USER_NGINX_GROUP}" ]]; then
+    MULTI_USER_NGINX_GROUP="$(awk '$1 == "user" {gsub(";", ""); print ($3 != "" ? $3 : $2); exit}' /etc/nginx/nginx.conf 2>/dev/null)"
+    if [[ -z "${MULTI_USER_NGINX_GROUP}" ]] || ! getent group "${MULTI_USER_NGINX_GROUP}" > /dev/null; then
+        MULTI_USER_NGINX_GROUP=""
+        for candidate in www-data nginx http nobody; do
+            if getent group "${candidate}" > /dev/null; then
+                MULTI_USER_NGINX_GROUP="${candidate}"
+                break
+            fi
+        done
+    fi
+    if [[ -z "${MULTI_USER_NGINX_GROUP}" ]]; then
+        echo "[ls.io-init] could not work out the nginx group, set MULTI_USER_NGINX_GROUP"
+        exit 1
+    fi
+    printf "%s" "${MULTI_USER_NGINX_GROUP}" > /run/s6/container_environment/MULTI_USER_NGINX_GROUP
+fi
+echo "[ls.io-init] nginx group for session sockets: ${MULTI_USER_NGINX_GROUP}"
+
+# sssd config, ldap bind against ad without a domain join
+ACCESS_PROVIDER="permit"
+if [[ -n "${LDAP_ALLOWED_GROUP}" ]]; then
+    ACCESS_PROVIDER="ldap"
+fi
+mkdir -p /etc/sssd
+cat > /etc/sssd/sssd.conf <<EOF
+[sssd]
+services = nss, pam
+domains = ldap
+
+[nss]
+filter_users = root, abc
+filter_groups = root, abc
+
+[pam]
+
+[domain/ldap]
+id_provider = ldap
+auth_provider = ldap
+access_provider = ${ACCESS_PROVIDER}
+ldap_uri = ${LDAP_URI}
+ldap_search_base = ${LDAP_BASE_DN}
+ldap_default_bind_dn = ${LDAP_BIND_DN}
+ldap_default_authtok_type = password
+ldap_default_authtok = ${LDAP_BIND_PASSWORD}
+ldap_schema = ad
+ldap_id_mapping = true
+ldap_referrals = false
+ldap_tls_reqcert = demand
+enumerate = false
+case_sensitive = false
+cache_credentials = true
+cached_auth_timeout = 300
+use_fully_qualified_names = false
+override_homedir = /config/home/%u
+default_shell = /bin/bash
+EOF
+if [[ "${ACCESS_PROVIDER}" == "ldap" ]]; then
+    echo "ldap_access_filter = (memberOf=${LDAP_ALLOWED_GROUP})" >> /etc/sssd/sssd.conf
+fi
+if [[ -n "${LDAP_TLS_CACERT}" ]]; then
+    echo "ldap_tls_cacert = ${LDAP_TLS_CACERT}" >> /etc/sssd/sssd.conf
+fi
+if [[ "${LDAP_URI}" != ldaps://* ]]; then
+    echo "ldap_id_use_start_tls = true" >> /etc/sssd/sssd.conf
+fi
+chown root:root /etc/sssd/sssd.conf
+chmod 600 /etc/sssd/sssd.conf
+
+# sssd has the bind password now, keep it out of every later service environment
+rm -f /run/s6/container_environment/LDAP_BIND_PASSWORD /run/s6/container_environment/FILE__LDAP_BIND_PASSWORD
+
+# resolve users and groups through sssd
+cat > /etc/nsswitch.conf <<EOF
+passwd: files sss
+group: files sss
+shadow: files sss
+hosts: files dns
+EOF
+
+# admin group gets sudo with its ad password
+rm -f /etc/sudoers.d/multiuser
+if [[ -n "${MULTI_USER_ADMIN_GROUP}" ]]; then
+    ADMIN_GROUP="${MULTI_USER_ADMIN_GROUP,,}"
+    echo "%${ADMIN_GROUP// /\\ } ALL=(ALL:ALL) ALL" > /etc/sudoers.d/multiuser
+    chmod 440 /etc/sudoers.d/multiuser
+    if ! visudo -cf /etc/sudoers.d/multiuser > /dev/null; then
+        echo "[ls.io-init] Invalid MULTI_USER_ADMIN_GROUP, not granting sudo"
+        rm -f /etc/sudoers.d/multiuser
+    fi
+fi
+
+# devices and printing are shared by every session, keep them off
+printf "true" > /run/s6/container_environment/NO_GAMEPAD
+printf "true" > /run/s6/container_environment/NO_WEBCAM
+if [[ -z ${SELKIES_PRINTING_ENABLED+x} ]]; then
+    printf "false" > /run/s6/container_environment/SELKIES_PRINTING_ENABLED
+fi
+
+# homes and session runtime
+mkdir -p /config/home /run/selkies /run/user
+chown root:root /config/home /run/selkies /run/user
+chmod 755 /config/home /run/selkies /run/user
+
+# every session's xvfb puts its socket here, it must not belong to the first user
+mkdir -p /tmp/.X11-unix
+chown root:root /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix

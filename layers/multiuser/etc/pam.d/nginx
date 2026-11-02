@@ -1,0 +1,3 @@
+# MULTI_USER web login, directory accounts only
+auth    required pam_sss.so
+account required pam_sss.so

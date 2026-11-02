@@ -1,0 +1,94 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# one desktop session for a directory user, supervised by s6 and started by selkies-broker
+MU_USER="${1}"
+IFS=: read -r MU_NAME _ MU_UID MU_GID _ MU_HOME _ < <(getent -s sss passwd "${MU_USER}")
+if [[ -z "${MU_NAME}" ]] || [[ ! "${MU_NAME}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || [[ "${MU_HOME}" != /config/home/* ]]; then
+    echo "[selkies-user-session] refusing unknown user ${MU_USER}"
+    sleep 10
+    exit 1
+fi
+
+# everything inside the home is done as the user so a planted symlink cannot redirect root
+# setpriv rather than s6-setuidgid, the static s6 tools cannot resolve sssd users
+run_as() {
+    setpriv --reuid="${MU_UID}" --regid="${MU_GID}" --init-groups "$@"
+}
+
+# home, defaults are only copied when missing
+if [[ ! -d "${MU_HOME}" ]]; then
+    echo "[selkies-user-session] creating ${MU_HOME}"
+    mkdir -p "${MU_HOME}"
+    chown "${MU_UID}:${MU_GID}" "${MU_HOME}"
+    chmod 700 "${MU_HOME}"
+fi
+run_as mkdir -p "${MU_HOME}/.config/openbox" "${MU_HOME}/Desktop" "${MU_HOME}/.local/bin"
+# sessions start the selkies desktop shell unless SELKIES_DESKTOP=false
+MU_DESKTOP="${SELKIES_DESKTOP:-true}"
+if [[ ! -f "${MU_HOME}/.config/openbox/autostart" ]]; then
+    if [[ "${MU_DESKTOP,,}" == "true" ]]; then
+        # the desktop is the session, no terminal maximized over it
+        # shellcheck disable=SC2016
+        run_as bash -c 'printf "# commands to run at login, one per line\n" > "${1}"' _ "${MU_HOME}/.config/openbox/autostart"
+    else
+        run_as cp /defaults/autostart "${MU_HOME}/.config/openbox/autostart"
+    fi
+fi
+if [[ ! -f "${MU_HOME}/.config/openbox/menu.xml" ]]; then
+    run_as cp /defaults/menu.xml "${MU_HOME}/.config/openbox/menu.xml"
+fi
+
+# proot-apps
+if ! diff -q /proot-apps/pversion "${MU_HOME}/.local/bin/pversion" > /dev/null 2>&1; then
+    run_as cp /proot-apps/* "${MU_HOME}/.local/bin/"
+fi
+run_as ln -sfn proot "${MU_HOME}/.local/bin/bwrap"
+# shellcheck disable=SC2016
+for line in 'export PATH="$HOME/.local/bin:$PATH"' 'source <(proot-apps completion bash)'; do
+    run_as bash -c 'grep -qsxF "${1}" "${2}" || printf "%s\n" "${1}" >> "${2}"' _ "${line}" "${MU_HOME}/.bashrc"
+done
+
+# gpu access, join the groups owning the render nodes
+for node in /dev/dri/*; do
+    [[ -c "${node}" ]] || continue
+    node_group="$(stat -c '%G' "${node}")"
+    if [[ "${node_group}" != "UNKNOWN" ]] && [[ "${node_group}" != "root" ]] && ! id -nG "${MU_NAME}" | grep -qw "${node_group}"; then
+        gpasswd -a "${MU_NAME}" "${node_group}" > /dev/null
+    fi
+done
+
+# selkies socket, the broker seals the folder once the socket is up
+SOCK_DIR="/run/selkies/${MU_NAME}"
+mkdir -p "${SOCK_DIR}"
+rm -f "${SOCK_DIR}/selkies.sock"
+chown "${MU_UID}:${MULTI_USER_NGINX_GROUP:-www-data}" "${SOCK_DIR}"
+chmod 2750 "${SOCK_DIR}"
+
+# runtime folder
+RUNTIME_DIR="/run/user/${MU_UID}"
+mkdir -p "${RUNTIME_DIR}"
+chown "${MU_UID}:${MU_GID}" "${RUNTIME_DIR}"
+chmod 700 "${RUNTIME_DIR}"
+
+# start xvfb, pulseaudio, openbox with the selkies desktop shell unless disabled, and selkies as the user
+cd "${MU_HOME}" || exit 1
+exec setpriv --reuid="${MU_UID}" --regid="${MU_GID}" --init-groups \
+    env \
+        -u CUPS_SERVER \
+        -u DISPLAY \
+        -u LDAP_BIND_PASSWORD \
+        -u PASSWORD \
+        -u PULSE_RUNTIME_PATH \
+        -u XAUTHORITY \
+        HOME="${MU_HOME}" \
+        USER="${MU_NAME}" \
+        LOGNAME="${MU_NAME}" \
+        XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+        BWRAP="${MU_HOME}/.local/bin/bwrap" \
+        XCURSOR_THEME=breeze_cursors \
+        SELKIES_DESKTOP="${MU_DESKTOP}" \
+        python3 -m selkies.session \
+            --session "/bin/bash /defaults/startwm.sh" \
+            --unix-socket "${SOCK_DIR}/selkies.sock" \
+            --enable-basic-auth=false
